@@ -1,804 +1,538 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use crate::*;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use thiserror::Error;
 
-use crate::{
-    Binder, Decl, EnumDecl, Expr, ModelSpec, ObjSense, Objective, Rule, ScenarioDecl, Stmt, Tok,
-    TokDelim, VarDecl, VarKind, VarRef,
-};
-
-/// Concrete cell coordinate (x,z) for 2D grid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Cell {
-    pub x: i32,
-    pub z: i32,
+#[derive(Debug, Error)]
+pub enum CodegenError {
+    #[error("unknown domain `{0}`")]
+    UnknownDomain(String),
+    #[error("unknown variable `{0}`")]
+    UnknownVar(String),
+    #[error("variable `{0}` used with wrong arity: expected {1}, got {2}")]
+    WrongArity(String, usize, usize),
+    #[error("unsupported expression in linear context: {0:?}")]
+    UnsupportedLinear(Expr),
+    #[error("unsupported boolean context: {0:?}")]
+    UnsupportedBool(Expr),
+    #[error("unsupported call `{0}`")]
+    UnsupportedCall(String),
+    #[error("Observe(pin, s=..) requires integer scenario, got `{0}`")]
+    BadScenario(String),
+    #[error("missing scenario binder `s` for call `{0}`")]
+    MissingScenarioBinder(String),
 }
 
-/// Concrete direction for typical 2D neighborhood.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Dir {
-    N,
-    E,
-    S,
-    W,
-}
-
-impl Dir {
-    pub fn all() -> [Dir; 4] {
-        [Dir::N, Dir::E, Dir::S, Dir::W]
-    }
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Dir::N => "N",
-            Dir::E => "E",
-            Dir::S => "S",
-            Dir::W => "W",
-        }
-    }
-    pub fn opp(&self) -> Dir {
-        match self {
-            Dir::N => Dir::S,
-            Dir::S => Dir::N,
-            Dir::E => Dir::W,
-            Dir::W => Dir::E,
-        }
-    }
-    pub fn delta(&self) -> (i32, i32) {
-        match self {
-            Dir::N => (0, -1),
-            Dir::S => (0, 1),
-            Dir::E => (1, 0),
-            Dir::W => (-1, 0),
-        }
-    }
-}
-
-/// Concrete layer (GROUND/TOP) for 2-layer modeling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Layer {
-    GROUND,
-    TOP,
-}
-impl Layer {
-    pub fn all() -> [Layer; 2] {
-        [Layer::GROUND, Layer::TOP]
-    }
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Layer::GROUND => "GROUND",
-            Layer::TOP => "TOP",
-        }
-    }
-}
-
-/// Runtime instantiation data needed to expand quantifiers into a flat ILP.
-pub struct Instance {
-    /// All cells used for `Cell` domain.
-    pub cells: Vec<Cell>,
-    /// Scenario values for scenario decls (usually [0,1]).
-    pub scenarios: Vec<i32>,
-    /// Optional parameters (e.g. wT, wS).
-    pub params: HashMap<String, f64>,
-    /// Pin observe mapping: Observe(PIN, s=<scenario>) -> a concrete variable reference.
-    pub observe: std::sync::Arc<dyn Fn(&str, i32) -> ConcreteVar + Send + Sync>,
-}
-
-/// A concrete variable instance: name + fully evaluated indices (already formatted).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ConcreteVar {
-    pub name: String,
-    pub indices: Vec<String>,
-}
-impl ConcreteVar {
-    pub fn lp_name(&self) -> String {
-        if self.indices.is_empty() {
-            return sanitize(&self.name);
-        }
-        let mut s = sanitize(&self.name);
-        for idx in &self.indices {
-            s.push_str("__");
-            s.push_str(&sanitize(idx));
-        }
-        s
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct LinearExpr {
-    pub constant: f64,
-    pub terms: BTreeMap<String, f64>, // var -> coeff
+#[derive(Clone, Debug)]
+struct LinearExpr {
+    terms: BTreeMap<String, f64>,
+    constant: f64,
 }
 impl LinearExpr {
-    pub fn zero() -> Self {
+    fn zero() -> Self {
         Self {
-            constant: 0.0,
             terms: BTreeMap::new(),
-        }
-    }
-    pub fn from_var(v: &str, coeff: f64) -> Self {
-        let mut t = BTreeMap::new();
-        t.insert(v.to_string(), coeff);
-        Self {
             constant: 0.0,
-            terms: t,
         }
     }
-    pub fn from_const(c: f64) -> Self {
-        Self {
-            constant: c,
-            terms: BTreeMap::new(),
-        }
+    fn from_const(v: f64) -> Self {
+        let mut e = Self::zero();
+        e.constant = v;
+        e
     }
-    pub fn add(mut self, other: LinearExpr) -> Self {
+    fn from_var(v: &str, c: f64) -> Self {
+        let mut e = Self::zero();
+        if c != 0.0 {
+            e.terms.insert(v.to_string(), c);
+        }
+        e
+    }
+    fn add_inplace(&mut self, other: &LinearExpr) {
         self.constant += other.constant;
-        for (k, v) in other.terms {
-            *self.terms.entry(k).or_insert(0.0) += v;
+        for (k, v) in other.terms.iter() {
+            *self.terms.entry(k.clone()).or_insert(0.0) += *v;
         }
-        self
+        self.terms.retain(|_, c| c.abs() > 1e-12);
     }
-    pub fn sub(mut self, other: LinearExpr) -> Self {
+    fn sub_inplace(&mut self, other: &LinearExpr) {
         self.constant -= other.constant;
-        for (k, v) in other.terms {
-            *self.terms.entry(k).or_insert(0.0) -= v;
+        for (k, v) in other.terms.iter() {
+            *self.terms.entry(k.clone()).or_insert(0.0) -= *v;
         }
-        self
+        self.terms.retain(|_, c| c.abs() > 1e-12);
     }
-    pub fn scale(mut self, s: f64) -> Self {
-        self.constant *= s;
-        for v in self.terms.values_mut() {
-            *v *= s;
+    fn scale(&self, k: f64) -> Self {
+        let mut e = Self::zero();
+        e.constant = self.constant * k;
+        for (n, c) in self.terms.iter() {
+            e.terms.insert(n.clone(), c * k);
         }
-        self
-    }
-    pub fn to_lp(&self) -> String {
-        let mut out = String::new();
-        let mut first = true;
-        // terms
-        for (var, coeff) in &self.terms {
-            if *coeff == 0.0 {
-                continue;
-            }
-            if first {
-                first = false;
-                out.push_str(&format!("{:+} {}", coeff, var));
-            } else {
-                out.push_str(&format!(" {:+} {}", coeff, var));
-            }
-        }
-        if self.constant != 0.0 || first {
-            if first {
-                out.push_str(&format!("{:+}", self.constant));
-            } else {
-                out.push_str(&format!(" {:+}", self.constant));
-            }
-        }
-        out
+        e
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum Sense {
-    Eq,
+#[derive(Clone, Copy, Debug)]
+enum Sense {
     Le,
     Ge,
+    Eq,
 }
 
-#[derive(Debug, Clone)]
-pub struct Constraint {
-    pub name: String,
-    pub expr: LinearExpr,
-    pub sense: Sense,
-    pub rhs: f64,
+#[derive(Clone, Debug)]
+struct Constraint {
+    name: String,
+    expr: LinearExpr, // lhs
+    sense: Sense,
+    rhs: f64,
 }
 
-pub struct Ilp {
-    pub objective_min: bool,
-    pub objective: LinearExpr,
-    pub constraints: Vec<Constraint>,
-    pub binaries: BTreeSet<String>,
+#[derive(Clone, Debug)]
+struct Ilp {
+    objective: LinearExpr,
+    sense: ObjSense,
+    constraints: Vec<Constraint>,
+    binaries: BTreeSet<String>,
 }
+
 impl Ilp {
-    pub fn to_scip_lp(&self) -> String {
-        let mut out = String::new();
-
-        out.push_str(if self.objective_min {
-            "Minimize\n"
-        } else {
-            "Maximize\n"
-        });
-
-        // objective: 상수항은 목적함수에 영향 없으니 버리는 게 안전
-        let mut obj = self.objective.clone();
-        obj.constant = 0.0;
-
-        out.push_str(" obj: ");
-        out.push_str(&obj.to_lp());
-        out.push_str("\nSubject To\n");
-
-        for c in &self.constraints {
-            // 🔥 핵심: LHS constant를 RHS로 넘김
-            let mut lhs = c.expr.clone();
-            let rhs = c.rhs - lhs.constant;
-            lhs.constant = 0.0;
-
-            out.push_str(&format!(" {}: {} ", sanitize(&c.name), lhs.to_lp()));
-            match c.sense {
-                Sense::Eq => out.push_str("= "),
-                Sense::Le => out.push_str("<= "),
-                Sense::Ge => out.push_str(">= "),
-            }
-            out.push_str(&format!("{:+}\n", rhs));
+    fn new() -> Self {
+        Self {
+            objective: LinearExpr::zero(),
+            sense: ObjSense::Minimize,
+            constraints: vec![],
+            binaries: BTreeSet::new(),
         }
-
-        out.push_str("Binary\n");
-        for v in &self.binaries {
-            out.push_str(" ");
-            out.push_str(v);
-            out.push_str("\n");
-        }
-        out.push_str("End\n");
-        out
     }
 }
 
-#[derive(Debug)]
-pub enum CodegenError {
-    MissingScenario,
-    Unsupported(String),
-    UnknownSymbol(String),
-    ConflictingBinder { var: String, a: String, b: String },
-    BadBinder(String),
-    IndexEval(String),
-}
-
-/// Primary entry: expand `spec` into a flat SCIP .lp ILP string.
-pub fn codegen_scip_lp(spec: &ModelSpec, inst: &Instance) -> Result<String, CodegenError> {
-    let env = Env::from_spec(spec, inst)?;
-    let mut gen = Generator::new(env);
-    gen.lower_model(spec)?;
-    Ok(gen.ilp.to_scip_lp())
-}
-
-/// Build-time environment extracted from the spec + instance.
+#[derive(Clone)]
 struct Env {
-    // declared var signatures: name -> indices domains
-    vars: HashMap<String, Vec<String>>,
-    // enum domains: name -> variants (strings)
-    enums: HashMap<String, Vec<String>>,
-    // scenario domains: name -> values (strings)
-    scenarios: HashMap<String, Vec<String>>,
-    // runtime instance
-    inst_cells: Vec<Cell>,
-    inst_scenarios: Vec<i32>,
+    // domain values
+    domains: HashMap<String, Vec<String>>,
+    // var signature: name -> domain names per index
+    sigs: HashMap<String, Vec<String>>,
+    // var kind for special lowering
+    var_kinds: HashMap<String, VarKind>,
+    // features + params + observe
+    features: HashSet<String>,
     params: HashMap<String, f64>,
     observe: std::sync::Arc<dyn Fn(&str, i32) -> ConcreteVar + Send + Sync>,
+    // cell set for topo bounds
+    cell_set: HashSet<String>,
 }
 
-impl Env {
-    fn from_spec(spec: &ModelSpec, inst: &Instance) -> Result<Self, CodegenError> {
-        let mut vars = HashMap::new();
-        let mut enums = HashMap::new();
-        let mut scenarios = HashMap::new();
+#[derive(Clone, Debug, Default)]
+struct Ctx {
+    bind: HashMap<String, String>,
+    lets: HashMap<String, String>,
+}
 
-        for d in &spec.decls {
-            match d {
-                Decl::Enum(EnumDecl { name, variants }) => {
-                    enums.insert(
-                        name.clone(),
-                        variants.iter().map(|v| v.name.clone()).collect(),
-                    );
-                }
-                Decl::Scenario(ScenarioDecl { name, values }) => {
-                    scenarios.insert(name.clone(), values.clone());
-                }
-                Decl::Var(VarDecl { name, indices, .. }) => {
-                    vars.insert(name.clone(), indices.clone());
-                }
-                _ => {}
-            }
-        }
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct SourceKey {
+    // canonical key name for source set: DustSrc__s__layer__cell
+    name: String,
+}
 
-        Ok(Self {
-            vars,
-            enums,
-            scenarios,
-            inst_cells: inst.cells.clone(),
-            inst_scenarios: inst.scenarios.clone(),
-            params: inst.params.clone(),
-            observe: inst.observe.clone(),
-        })
-    }
+#[derive(Clone, Debug)]
+struct SourceDB {
+    adds: HashMap<SourceKey, Vec<Expr>>,
+    excludes: HashMap<SourceKey, Vec<Expr>>,
+}
 
-    fn domain_values(&self, dom: &str) -> Result<Vec<String>, CodegenError> {
-        if dom == "Cell" {
-            return Ok(self
-                .inst_cells
-                .iter()
-                .map(|c| format!("x{}_z{}", c.x, c.z))
-                .collect());
+impl SourceDB {
+    fn new() -> Self {
+        Self {
+            adds: HashMap::new(),
+            excludes: HashMap::new(),
         }
-        if let Some(v) = self.enums.get(dom) {
-            return Ok(v.clone());
-        }
-        if let Some(v) = self.scenarios.get(dom) {
-            return Ok(v.clone());
-        }
-        // Common aliases: Sc for scenario
-        if dom == "Sc" {
-            return Ok(self.inst_scenarios.iter().map(|v| v.to_string()).collect());
-        }
-        Err(CodegenError::Unsupported(format!("unknown domain {dom}")))
-    }
-
-    fn param(&self, name: &str) -> Option<f64> {
-        self.params.get(name).copied()
     }
 }
 
+#[derive(Clone)]
 struct Generator {
     env: Env,
     ilp: Ilp,
-    aux_counter: usize,
+    sources: SourceDB,
+    // cache: sources key -> OR var
+    sources_or_cache: HashMap<SourceKey, String>,
+    aux_id: usize,
+}
+
+pub fn codegen_scip_lp(spec: &ModelSpec, inst: &Instance) -> Result<String, CodegenError> {
+    let env = build_env(spec, inst)?;
+    let mut gen = Generator {
+        env,
+        ilp: Ilp::new(),
+        sources: SourceDB::new(),
+        sources_or_cache: HashMap::new(),
+        aux_id: 0,
+    };
+
+    // constants
+    gen.ilp.binaries.insert("__const0".to_string());
+    gen.ilp.binaries.insert("__const1".to_string());
+    gen.ilp.constraints.push(Constraint {
+        name: "__fix_const0".to_string(),
+        expr: LinearExpr::from_var("__const0", 1.0),
+        sense: Sense::Eq,
+        rhs: 0.0,
+    });
+    gen.ilp.constraints.push(Constraint {
+        name: "__fix_const1".to_string(),
+        expr: LinearExpr::from_var("__const1", 1.0),
+        sense: Sense::Eq,
+        rhs: 1.0,
+    });
+
+    // 1) collect sources
+    gen.collect_sources(spec)?;
+
+    // 2) emit constraints (Require/Def/ForceEq) + objective
+    gen.emit_model(spec)?;
+
+    // normalize constraints: move constants to rhs
+    for c in gen.ilp.constraints.iter_mut() {
+        if c.expr.constant.abs() > 1e-12 {
+            c.rhs -= c.expr.constant;
+            c.expr.constant = 0.0;
+        }
+    }
+    if gen.ilp.objective.constant.abs() > 1e-12 {
+        // drop constant objective
+        gen.ilp.objective.constant = 0.0;
+    }
+
+    Ok(emit_lp(&gen.ilp))
+}
+
+fn build_env(spec: &ModelSpec, inst: &Instance) -> Result<Env, CodegenError> {
+    let mut domains: HashMap<String, Vec<String>> = HashMap::new();
+
+    // default Cell domain from instance
+    let cell_vals: Vec<String> = inst.cells.iter().map(|c| c.id()).collect();
+    domains.insert("Cell".to_string(), cell_vals.clone());
+
+    // default Layer/Dir if declared; we'll override from enums
+    domains.insert("Layer".to_string(), vec!["GROUND".into(), "TOP".into()]);
+    domains.insert(
+        "Dir".to_string(),
+        vec!["N".into(), "E".into(), "S".into(), "W".into()],
+    );
+
+    // Scenario domain
+    domains.insert(
+        "s".to_string(),
+        inst.scenarios.iter().map(|v| v.to_string()).collect(),
+    );
+    domains.insert(
+        "Sc".to_string(),
+        inst.scenarios.iter().map(|v| v.to_string()).collect(),
+    );
+
+    let mut sigs: HashMap<String, Vec<String>> = HashMap::new();
+    let mut var_kinds: HashMap<String, VarKind> = HashMap::new();
+
+    for d in &spec.decls {
+        match d {
+            Decl::Enum { name, variants } => {
+                domains.insert(name.clone(), variants.clone());
+            }
+            Decl::Scenario { name, values } => {
+                domains.insert(name.clone(), values.iter().map(|v| v.to_string()).collect());
+            }
+            Decl::Var {
+                kind,
+                name,
+                indices,
+                ..
+            } => {
+                sigs.insert(name.clone(), indices.clone());
+                var_kinds.insert(name.clone(), kind.clone());
+            }
+            Decl::Index { name, .. } => {
+                // index decl indicates a domain name exists; already covered by instance for Cell.
+                if name != "Cell" && !domains.contains_key(name) {
+                    domains.insert(name.clone(), vec![]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let cell_set = cell_vals.into_iter().collect::<HashSet<_>>();
+
+    Ok(Env {
+        domains,
+        sigs,
+        var_kinds,
+        features: inst.features.clone(),
+        params: inst.params.clone(),
+        observe: inst.observe.clone(),
+        cell_set,
+    })
 }
 
 impl Generator {
-    fn new(env: Env) -> Self {
-        Self {
-            env,
-            ilp: Ilp {
-                objective_min: true,
-                objective: LinearExpr::zero(),
-                constraints: vec![],
-                binaries: BTreeSet::new(),
-            },
-            aux_counter: 0,
-        }
+    fn fresh_aux(&mut self, prefix: &str) -> String {
+        let n = self.aux_id;
+        self.aux_id += 1;
+        format!("__aux_{}_{}", prefix, n)
     }
 
-    fn lower_model(&mut self, spec: &ModelSpec) -> Result<(), CodegenError> {
-        // Objective
-        if let Some(obj) = &spec.objective {
-            self.ilp.objective_min = obj.sense == ObjSense::Minimize;
-            let expr = self.eval_linear_expr(&obj.body, &Ctx::default())?;
-            self.ilp.objective = expr;
-        }
-
-        // Fix boolean constants as binaries:
-        self.ilp.binaries.insert("__const0".into());
-        self.ilp.binaries.insert("__const1".into());
-        self.ilp.constraints.push(Constraint {
-            name: "const0".into(),
-            expr: LinearExpr::from_var("__const0", 1.0),
-            sense: Sense::Eq,
-            rhs: 0.0,
-        });
-        self.ilp.constraints.push(Constraint {
-            name: "const1".into(),
-            expr: LinearExpr::from_var("__const1", 1.0),
-            sense: Sense::Eq,
-            rhs: 1.0,
-        });
-
-        // Rules
-        for rule in &spec.rules {
-            self.lower_rule(rule)?;
-        }
-
-        Ok(())
+    fn is_feature_on(&self, name: &str) -> bool {
+        self.env.features.contains(name)
     }
 
-    fn lower_rule(&mut self, rule: &Rule) -> Result<(), CodegenError> {
-        // We process statements sequentially, with `let` bindings captured as AST in ctx.
-        self.lower_block(&rule.name, &rule.body, &Ctx::default())
+    fn domain_vals(&self, name: &str) -> Result<Vec<String>, CodegenError> {
+        self.env
+            .domains
+            .get(name)
+            .cloned()
+            .ok_or_else(|| CodegenError::UnknownDomain(name.to_string()))
     }
 
-    fn lower_block(
-        &mut self,
-        rule_name: &str,
-        body: &[Stmt],
-        base_ctx: &Ctx,
-    ) -> Result<(), CodegenError> {
-        // We want to expand each statement with implicit forall. We do it per-stmt.
-        let mut ctx = base_ctx.clone();
-        for (i, st) in body.iter().enumerate() {
-            match st {
-                Stmt::Let { name, value } => {
-                    ctx.lets.insert(name.clone(), value.clone());
-                }
-                Stmt::Feature { name: _, body } => {
-                    // For now, we always include features. You can add an enable/disable map later.
-                    self.lower_block(rule_name, body, &ctx)?;
-                }
-                Stmt::ForAll { binders, body } => {
-                    // Explicit forall(...) { ... } block expansion.
-                    self.expand_forall_block(
-                        rule_name,
-                        i,
-                        binders,
-                        body,
-                        &ctx,
-                        0,
-                        &mut HashMap::new(),
-                    )?;
-                }
-                _ => {
-                    // Expand this statement for all inferred binder vars.
-                    let let_names: BTreeSet<String> = ctx.lets.keys().cloned().collect();
-                    let binders = infer_binders(st, &self.env.vars, &let_names)?;
-                    let binder_list: Vec<(String, String)> = binders.into_iter().collect(); // (var, domain)
-                    self.expand_forall(
-                        rule_name,
-                        i,
-                        st,
-                        &ctx,
-                        &binder_list,
-                        0,
-                        &mut HashMap::new(),
-                    )?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn expand_forall(
-        &mut self,
-        rule_name: &str,
-        stmt_idx: usize,
-        st: &Stmt,
-        ctx: &Ctx,
-        binder_list: &[(String, String)],
-        depth: usize,
-        assign: &mut HashMap<String, String>,
-    ) -> Result<(), CodegenError> {
-        if depth == binder_list.len() {
-            // Evaluate statement under this assignment.
-            let mut local = ctx.clone();
-            local.binders = assign.clone();
-            self.lower_stmt(rule_name, stmt_idx, st, &local)?;
-            return Ok(());
-        }
-        let (v, dom) = &binder_list[depth];
-        let vals = self.env.domain_values(dom)?;
-        for val in vals {
-            assign.insert(v.clone(), val);
-            self.expand_forall(rule_name, stmt_idx, st, ctx, binder_list, depth + 1, assign)?;
-        }
-        Ok(())
-    }
-
-    fn expand_forall_block(
-        &mut self,
-        rule_name: &str,
-        stmt_idx: usize,
-        binders: &[(String, String)],
-        body: &[Stmt],
-        ctx: &Ctx,
-        depth: usize,
-        assign: &mut HashMap<String, String>,
-    ) -> Result<(), CodegenError> {
-        if depth == binders.len() {
-            let mut local = ctx.clone();
-            local.binders = assign.clone();
-            // In explicit forall, DO NOT run implicit binder inference; evaluate body directly.
-            self.lower_block_explicit(rule_name, stmt_idx, body, &local)?;
-            return Ok(());
-        }
-        let (v, dom) = &binders[depth];
-        let vals = self.env.domain_values(dom)?;
-        for val in vals {
-            assign.insert(v.clone(), val);
-            self.expand_forall_block(rule_name, stmt_idx, binders, body, ctx, depth + 1, assign)?;
-        }
-        Ok(())
-    }
-
-    fn lower_block_explicit(
-        &mut self,
-        rule_name: &str,
-        base_idx: usize,
-        body: &[Stmt],
-        base_ctx: &Ctx,
-    ) -> Result<(), CodegenError> {
-        let mut ctx = base_ctx.clone();
-        for (j, st) in body.iter().enumerate() {
-            match st {
-                Stmt::Let { name, value } => {
-                    ctx.lets.insert(name.clone(), value.clone());
-                }
-                Stmt::Feature { name: _, body } => {
-                    self.lower_block_explicit(rule_name, base_idx, body, &ctx)?;
-                }
-                Stmt::ForAll { binders, body } => {
-                    self.expand_forall_block(
-                        rule_name,
-                        base_idx * 1000 + j,
-                        binders,
-                        body,
-                        &ctx,
-                        0,
-                        &mut HashMap::new(),
-                    )?;
-                }
-                _ => {
-                    let idx = base_idx * 1000 + j;
-                    self.lower_stmt(rule_name, idx, st, &ctx)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn lower_stmt(
-        &mut self,
-        rule_name: &str,
-        stmt_idx: usize,
-        st: &Stmt,
-        ctx: &Ctx,
-    ) -> Result<(), CodegenError> {
-        match st {
-            Stmt::ForAll { binders, body } => {
-                self.expand_forall_block(
-                    rule_name,
-                    stmt_idx,
-                    binders,
-                    body,
-                    ctx,
-                    0,
-                    &mut HashMap::new(),
-                )?;
-            }
-            Stmt::Require(e) => {
-                let v = self.eval_bool_expr(e, ctx)?;
-                // require v == 1
-                self.add_eq1(&format!("{rule_name}_req{stmt_idx}_{}", ctx.suffix()), &v);
-            }
-            Stmt::Def { lhs, op: _, rhs } => {
-                let lhs_v = self.eval_varref(lhs, ctx)?;
-                self.ilp.binaries.insert(lhs_v.clone());
-                let rhs_v = self.eval_bool_expr(rhs, ctx)?;
-                // lhs == rhs
-                self.add_eq_var(
-                    &format!("{rule_name}_def{stmt_idx}_{}", ctx.suffix()),
-                    &lhs_v,
-                    &rhs_v,
-                );
-            }
-            Stmt::ForceEq { lhs, rhs } => {
-                // Special-case: Observe(pin, s=..) is treated via instance mapping.
-                let le = self.eval_linear_expr(lhs, ctx)?;
-                let re = self.eval_linear_expr(rhs, ctx)?;
-                // move to LHS: le - re == 0
-                let expr = le.sub(re);
-                self.ilp.constraints.push(Constraint {
-                    name: format!("{rule_name}_force{stmt_idx}_{}", ctx.suffix()),
-                    expr,
-                    sense: Sense::Eq,
-                    rhs: 0.0,
-                });
-            }
-            Stmt::Add { .. } => {
-                // sources wiring not lowered in this minimal codegen
-            }
-            Stmt::Feature { .. } => {}
-            Stmt::Let { .. } => {}
-        }
-        Ok(())
-    }
-
-    fn add_eq1(&mut self, base: &str, v: &str) {
-        self.ilp.constraints.push(Constraint {
-            name: format!("{base}_{}", self.aux_counter),
-            expr: LinearExpr::from_var(v, 1.0),
-            sense: Sense::Eq,
-            rhs: 1.0,
-        });
-        self.aux_counter += 1;
-    }
-
-    fn add_eq_var(&mut self, base: &str, a: &str, b: &str) {
-        // a - b == 0
-        let expr = LinearExpr::from_var(a, 1.0).sub(LinearExpr::from_var(b, 1.0));
-        self.ilp.constraints.push(Constraint {
-            name: format!("{base}_{}", self.aux_counter),
-            expr,
-            sense: Sense::Eq,
-            rhs: 0.0,
-        });
-        self.aux_counter += 1;
-    }
-
-    fn new_aux(&mut self, prefix: &str) -> String {
-        let v = format!("__aux_{}_{}", prefix, self.aux_counter);
-        self.aux_counter += 1;
-        let v = sanitize(&v);
-        self.ilp.binaries.insert(v.clone());
-        v
-    }
-
-    fn eval_varref(&mut self, vr: &VarRef, ctx: &Ctx) -> Result<String, CodegenError> {
-        let mut idxs = vec![];
-        for e in &vr.indices {
-            idxs.push(self.eval_index(e, ctx)?);
-        }
-        let cv = ConcreteVar {
-            name: vr.name.clone(),
-            indices: idxs,
-        };
-        let vname = cv.lp_name();
-        self.ilp.binaries.insert(vname.clone());
-        Ok(vname)
-    }
-
-    fn eval_index(&mut self, e: &Expr, ctx: &Ctx) -> Result<String, CodegenError> {
+    fn eval_index(&self, e: &Expr, ctx: &Ctx) -> Result<String, CodegenError> {
         match e {
             Expr::Sym(s) => {
-                if let Some(v) = ctx.binders.get(s) {
+                if let Some(v) = ctx.lets.get(s) {
                     return Ok(v.clone());
                 }
-                if let Some(v) = ctx.lets.get(s) {
-                    return self.eval_index(v, ctx);
+                if let Some(v) = ctx.bind.get(s) {
+                    return Ok(v.clone());
                 }
-                // Allow Layer/Dir literals as symbols
+                // enum literal or domain value
                 Ok(s.clone())
             }
-            Expr::Lit(l) => Ok(l.clone()),
-            Expr::Call { name, args } => {
-                // handle neigh(c,d) / supportForWallTorch(c,d) as pure string evaluation for now:
-                // return "NONE" if cannot evaluate -> caller should avoid using it for out-of-grid; we can't in this minimal engine.
-                let mut ev = vec![];
-                for a in args {
-                    match a {
-                        Expr::NamedArg { name: _, value } => ev.push(self.eval_index(value, ctx)?),
-                        _ => ev.push(self.eval_index(a, ctx)?),
-                    }
-                }
-                Ok(format!("{name}({})", ev.join(",")))
-            }
+            Expr::Lit(v) => Ok(format!("{}", *v as i64)),
             Expr::Paren(x) => self.eval_index(x, ctx),
-            _ => Err(CodegenError::IndexEval(format!(
-                "unsupported index expr: {e:?}"
-            ))),
+            Expr::Call { name, args } => self.eval_index_call(name, args, ctx),
+            _ => Err(CodegenError::UnsupportedLinear(e.clone())),
         }
     }
 
-    fn eval_linear_expr(&mut self, e: &Expr, ctx: &Ctx) -> Result<LinearExpr, CodegenError> {
+    fn parse_cell_id(id: &str) -> Option<(i32, i32)> {
+        // x{X}_z{Z}
+        let re = regex::Regex::new(r"^x(-?\d+)_z(-?\d+)$").ok()?;
+        let caps = re.captures(id)?;
+        let x = caps.get(1)?.as_str().parse::<i32>().ok()?;
+        let z = caps.get(2)?.as_str().parse::<i32>().ok()?;
+        Some((x, z))
+    }
+
+    fn eval_index_call(
+        &self,
+        name: &str,
+        args: &[Expr],
+        ctx: &Ctx,
+    ) -> Result<String, CodegenError> {
+        match name {
+            "opp" => {
+                let d = self.eval_index(&args[0], ctx)?;
+                Ok(match d.as_str() {
+                    "N" => "S".into(),
+                    "S" => "N".into(),
+                    "E" => "W".into(),
+                    "W" => "E".into(),
+                    _ => d,
+                })
+            }
+            "neigh" | "back" | "front" | "supportForWallTorch" => {
+                let c = self.eval_index(&args[0], ctx)?;
+                let d = if name == "back" {
+                    let dd = self.eval_index(&args[1], ctx)?;
+                    match dd.as_str() {
+                        "N" => "S".into(),
+                        "S" => "N".into(),
+                        "E" => "W".into(),
+                        "W" => "E".into(),
+                        _ => dd,
+                    }
+                } else if name == "supportForWallTorch" {
+                    let dd = self.eval_index(&args[1], ctx)?;
+                    match dd.as_str() {
+                        "N" => "S".into(),
+                        "S" => "N".into(),
+                        "E" => "W".into(),
+                        "W" => "E".into(),
+                        _ => dd,
+                    }
+                } else {
+                    self.eval_index(&args[1], ctx)?
+                };
+                let Some((x, z)) = Self::parse_cell_id(&c) else {
+                    return Ok("__NONE__".into());
+                };
+                let (dx, dz) = match d.as_str() {
+                    "N" => (0, -1),
+                    "S" => (0, 1),
+                    "E" => (1, 0),
+                    "W" => (-1, 0),
+                    _ => (0, 0),
+                };
+                let (nx, nz) = (x + dx, z + dz);
+                let nid = format!("x{}_z{}", nx, nz);
+                if self.env.cell_set.contains(&nid) {
+                    Ok(nid)
+                } else {
+                    Ok("__NONE__".into())
+                }
+            }
+            _ => Ok(format!("{}({})", name, args.len())),
+        }
+    }
+
+    fn var_sig(&self, name: &str) -> Result<Vec<String>, CodegenError> {
+        self.env
+            .sigs
+            .get(name)
+            .cloned()
+            .ok_or_else(|| CodegenError::UnknownVar(name.to_string()))
+    }
+
+    fn var_kind(&self, name: &str) -> Option<VarKind> {
+        self.env.var_kinds.get(name).cloned()
+    }
+
+    fn var_name(&mut self, vr: &VarRef, ctx: &Ctx) -> Result<String, CodegenError> {
+        let sig = self.var_sig(&vr.name)?;
+        if sig.len() != vr.indices.len() {
+            return Err(CodegenError::WrongArity(
+                vr.name.clone(),
+                sig.len(),
+                vr.indices.len(),
+            ));
+        }
+        let mut parts = vec![vr.name.clone()];
+        for idx in &vr.indices {
+            let s = self.eval_index(idx, ctx)?;
+            if s == "__NONE__" {
+                return Ok("__const0".into());
+            }
+            parts.push(s);
+        }
+        let n = parts.join("__");
+        // every declared var is binary in this model (0/1)
+        self.ilp.binaries.insert(n.clone());
+        Ok(n)
+    }
+
+    fn as_const_param(&self, e: &Expr, ctx: &Ctx) -> Option<f64> {
         match e {
-            Expr::Lit(l) => {
-                let v: f64 = l
-                    .parse()
-                    .map_err(|_| CodegenError::Unsupported(format!("bad literal {l}")))?;
-                Ok(LinearExpr::from_const(v))
+            Expr::Lit(v) => Some(*v),
+            Expr::Sym(s) => self.env.params.get(s).cloned(),
+            Expr::Paren(x) => self.as_const_param(x, ctx),
+            _ => None,
+        }
+    }
+
+    fn eval_linear(&mut self, e: &Expr, ctx: &Ctx) -> Result<LinearExpr, CodegenError> {
+        match e {
+            Expr::Lit(v) => Ok(LinearExpr::from_const(*v)),
+            Expr::Sym(s) => {
+                if let Some(v) = self.env.params.get(s) {
+                    Ok(LinearExpr::from_const(*v))
+                } else if s == "__const0" {
+                    Ok(LinearExpr::from_var("__const0", 1.0))
+                } else if s == "__const1" {
+                    Ok(LinearExpr::from_var("__const1", 1.0))
+                } else {
+                    // allow linear context only for params or constants
+                    Err(CodegenError::UnsupportedLinear(e.clone()))
+                }
             }
             Expr::Var(vr) => {
-                let v = self.eval_varref(vr, ctx)?;
-                Ok(LinearExpr::from_var(&v, 1.0))
+                // treat as 0/1 variable
+                let n = self.var_name(vr, ctx)?;
+                Ok(LinearExpr::from_var(&n, 1.0))
             }
-            Expr::Sym(s) => {
-                if let Some(v) = ctx.binders.get(s) {
-                    return Ok(LinearExpr::from_const(v.parse::<f64>().unwrap_or(0.0)));
-                }
-                if let Some(v) = self.env.param(s) {
-                    return Ok(LinearExpr::from_const(v));
-                }
-                Err(CodegenError::UnknownSymbol(s.clone()))
+            Expr::Add(a, b) => {
+                let mut x = self.eval_linear(a, ctx)?;
+                let y = self.eval_linear(b, ctx)?;
+                x.add_inplace(&y);
+                Ok(x)
             }
-            Expr::Add(a, b) => Ok(self
-                .eval_linear_expr(a, ctx)?
-                .add(self.eval_linear_expr(b, ctx)?)),
-            Expr::Sub(a, b) => Ok(self
-                .eval_linear_expr(a, ctx)?
-                .sub(self.eval_linear_expr(b, ctx)?)),
+            Expr::Sub(a, b) => {
+                let mut x = self.eval_linear(a, ctx)?;
+                let y = self.eval_linear(b, ctx)?;
+                x.sub_inplace(&y);
+                Ok(x)
+            }
             Expr::Mul(a, b) => {
-                // allow const * linear
-                let la = self.eval_linear_expr(a, ctx)?;
-                let lb = self.eval_linear_expr(b, ctx)?;
-                if la.terms.is_empty() {
-                    Ok(lb.scale(la.constant))
-                } else if lb.terms.is_empty() {
-                    Ok(la.scale(lb.constant))
+                // only constant * linear
+                if let Some(k) = self.as_const_param(a, ctx) {
+                    let x = self.eval_linear(b, ctx)?;
+                    Ok(x.scale(k))
+                } else if let Some(k) = self.as_const_param(b, ctx) {
+                    let x = self.eval_linear(a, ctx)?;
+                    Ok(x.scale(k))
                 } else {
-                    Err(CodegenError::Unsupported("nonlinear mul".into()))
+                    Err(CodegenError::UnsupportedLinear(e.clone()))
                 }
             }
-            Expr::Sum { binder, body } => {
-                let (bind_vars, domains) = parse_binder(binder)?;
-                if bind_vars.len() != domains.len() {
-                    return Err(CodegenError::BadBinder(
-                        "binder vars/domains mismatch".into(),
-                    ));
-                }
+            Expr::Sum { binders, body } => {
                 let mut acc = LinearExpr::zero();
-                // Build cartesian product.
-                let dom_vals: Vec<Vec<String>> = domains
-                    .iter()
-                    .map(|d| self.env.domain_values(d))
-                    .collect::<Result<_, _>>()?;
-                for combo in cartesian(&dom_vals) {
-                    let mut c2 = ctx.clone();
-                    for (i, v) in bind_vars.iter().enumerate() {
-                        c2.binders.insert(v.clone(), combo[i].clone());
-                    }
-                    acc = acc.add(self.eval_linear_expr(body, &c2)?);
-                }
+                self.expand_binders(binders, ctx, |g, cctx| {
+                    let t = g.eval_linear(body, &cctx)?;
+                    acc.add_inplace(&t);
+                    Ok(())
+                })?;
                 Ok(acc)
             }
-            Expr::Paren(x) => self.eval_linear_expr(x, ctx),
-            Expr::Call { name, args } => {
-                if name == "Observe" {
-                    // Observe(IN, s=0)
-                    let mut pin: Option<String> = None;
-                    let mut sc: Option<i32> = None;
-                    for a in args {
-                        match a {
-                            Expr::Sym(s) => {
-                                if pin.is_none() {
-                                    pin = Some(s.clone());
-                                }
-                            }
-                            Expr::NamedArg { name, value } if name == "s" => {
-                                let sv = self.eval_index(value, ctx)?;
-                                sc = Some(sv.parse().map_err(|_| {
-                                    CodegenError::Unsupported("Observe s must be int".into())
-                                })?);
-                            }
-                            _ => {}
-                        }
-                    }
-                    let pin =
-                        pin.ok_or_else(|| CodegenError::Unsupported("Observe missing pin".into()))?;
-                    let sc =
-                        sc.ok_or_else(|| CodegenError::Unsupported("Observe missing s=".into()))?;
-                    let cv = (self.env.observe)(&pin, sc);
-                    let vname = cv.lp_name();
-                    self.ilp.binaries.insert(vname.clone());
-                    return Ok(LinearExpr::from_var(&vname, 1.0));
-                }
-                Err(CodegenError::Unsupported(format!(
-                    "call {name} in linear expr"
-                )))
-            }
-            Expr::NamedArg { .. } => Err(CodegenError::Unsupported("named arg as expr".into())),
-            _ => Err(CodegenError::Unsupported(format!(
-                "unsupported linear expr: {e:?}"
-            ))),
+            Expr::Paren(x) => self.eval_linear(x, ctx),
+            _ => Err(CodegenError::UnsupportedLinear(e.clone())),
         }
     }
 
-    fn eval_bool_expr(&mut self, e: &Expr, ctx: &Ctx) -> Result<String, CodegenError> {
+    fn eval_linear_or_boolish(&mut self, e: &Expr, ctx: &Ctx) -> Result<LinearExpr, CodegenError> {
+        match self.eval_linear(e, ctx) {
+            Ok(x) => Ok(x),
+            Err(CodegenError::UnsupportedLinear(_)) => {
+                let v = self.eval_bool(e, ctx)?;
+                Ok(LinearExpr::from_var(&v, 1.0))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn eval_bool(&mut self, e: &Expr, ctx: &Ctx) -> Result<String, CodegenError> {
         match e {
-            Expr::Var(vr) => self.eval_varref(vr, ctx),
-            Expr::Lit(l) => {
-                if l == "0" {
-                    return Ok("__const0".into());
+            Expr::Lit(v) => Ok(if (*v - 0.0).abs() < 1e-9 {
+                "__const0".into()
+            } else {
+                "__const1".into()
+            }),
+            Expr::Var(vr) => {
+                // sources varref is special
+                if self.var_kind(&vr.name) == Some(VarKind::Sources) {
+                    let key = self.sources_key(vr, ctx)?;
+                    self.ensure_sources_or(&key)
+                } else {
+                    self.var_name(vr, ctx)
                 }
-                if l == "1" {
-                    return Ok("__const1".into());
-                }
-                Err(CodegenError::Unsupported(format!(
-                    "bool literal must be 0/1, got {l}"
-                )))
             }
             Expr::Not(x) => {
-                let a = self.eval_bool_expr(x, ctx)?;
+                let a = self.eval_bool(x, ctx)?;
                 if a == "__const0" {
                     return Ok("__const1".into());
                 }
                 if a == "__const1" {
                     return Ok("__const0".into());
                 }
-                let v = self.new_aux("not");
-                // v + a = 1
-                let expr = LinearExpr::from_var(&v, 1.0).add(LinearExpr::from_var(&a, 1.0));
+                let y = self.fresh_aux("not");
+                self.ilp.binaries.insert(y.clone());
+                // y + a = 1
+                let mut lhs = LinearExpr::from_var(&y, 1.0);
+                lhs.add_inplace(&LinearExpr::from_var(&a, 1.0));
                 self.ilp.constraints.push(Constraint {
-                    name: format!("not_{}", v),
-                    expr,
+                    name: format!("not_{}", y),
+                    expr: lhs,
                     sense: Sense::Eq,
                     rhs: 1.0,
                 });
-                Ok(v)
+                Ok(y)
             }
             Expr::And(a, b) => {
-                let x = self.eval_bool_expr(a, ctx)?;
-                let y = self.eval_bool_expr(b, ctx)?;
+                let x = self.eval_bool(a, ctx)?;
+                let y = self.eval_bool(b, ctx)?;
                 if x == "__const0" || y == "__const0" {
                     return Ok("__const0".into());
                 }
@@ -808,34 +542,37 @@ impl Generator {
                 if y == "__const1" {
                     return Ok(x);
                 }
-                let v = self.new_aux("and");
-                // v <= x, v <= y, v >= x+y-1
+                let z = self.fresh_aux("and");
+                self.ilp.binaries.insert(z.clone());
+                // z <= x
                 self.ilp.constraints.push(Constraint {
-                    name: format!("and_le1_{}", v),
-                    expr: LinearExpr::from_var(&v, 1.0).sub(LinearExpr::from_var(&x, 1.0)),
+                    name: format!("and_le1_{}", z),
+                    expr: LinearExpr::from_var(&z, 1.0).sub(LinearExpr::from_var(&x, 1.0)),
                     sense: Sense::Le,
                     rhs: 0.0,
                 });
+                // z <= y
                 self.ilp.constraints.push(Constraint {
-                    name: format!("and_le2_{}", v),
-                    expr: LinearExpr::from_var(&v, 1.0).sub(LinearExpr::from_var(&y, 1.0)),
+                    name: format!("and_le2_{}", z),
+                    expr: LinearExpr::from_var(&z, 1.0).sub(LinearExpr::from_var(&y, 1.0)),
                     sense: Sense::Le,
                     rhs: 0.0,
                 });
-                let expr = LinearExpr::from_var(&v, 1.0)
-                    .sub(LinearExpr::from_var(&x, 1.0))
-                    .sub(LinearExpr::from_var(&y, 1.0));
+                // z >= x + y - 1  <=>  z - x - y >= -1
+                let mut expr = LinearExpr::from_var(&z, 1.0);
+                expr.sub_inplace(&LinearExpr::from_var(&x, 1.0));
+                expr.sub_inplace(&LinearExpr::from_var(&y, 1.0));
                 self.ilp.constraints.push(Constraint {
-                    name: format!("and_ge_{}", v),
+                    name: format!("and_ge_{}", z),
                     expr,
                     sense: Sense::Ge,
                     rhs: -1.0,
                 });
-                Ok(v)
+                Ok(z)
             }
             Expr::Or(a, b) => {
-                let x = self.eval_bool_expr(a, ctx)?;
-                let y = self.eval_bool_expr(b, ctx)?;
+                let x = self.eval_bool(a, ctx)?;
+                let y = self.eval_bool(b, ctx)?;
                 if x == "__const1" || y == "__const1" {
                     return Ok("__const1".into());
                 }
@@ -845,398 +582,931 @@ impl Generator {
                 if y == "__const0" {
                     return Ok(x);
                 }
-                let v = self.new_aux("or");
-                // v >= x, v >= y, v <= x+y
+                let z = self.fresh_aux("or");
+                self.ilp.binaries.insert(z.clone());
+                // z >= x  => -z + x <= 0? actually z - x >=0 => -z + x <=0
                 self.ilp.constraints.push(Constraint {
-                    name: format!("or_ge1_{}", v),
-                    expr: LinearExpr::from_var(&v, 1.0).sub(LinearExpr::from_var(&x, 1.0)),
-                    sense: Sense::Ge,
+                    name: format!("or_ge1_{}", z),
+                    expr: LinearExpr::from_var(&x, 1.0).sub(LinearExpr::from_var(&z, 1.0)),
+                    sense: Sense::Le,
                     rhs: 0.0,
                 });
                 self.ilp.constraints.push(Constraint {
-                    name: format!("or_ge2_{}", v),
-                    expr: LinearExpr::from_var(&v, 1.0).sub(LinearExpr::from_var(&y, 1.0)),
-                    sense: Sense::Ge,
+                    name: format!("or_ge2_{}", z),
+                    expr: LinearExpr::from_var(&y, 1.0).sub(LinearExpr::from_var(&z, 1.0)),
+                    sense: Sense::Le,
                     rhs: 0.0,
                 });
-                let expr = LinearExpr::from_var(&v, 1.0)
-                    .sub(LinearExpr::from_var(&x, 1.0))
-                    .sub(LinearExpr::from_var(&y, 1.0));
+                // z <= x + y  => z - x - y <=0
+                let mut expr = LinearExpr::from_var(&z, 1.0);
+                expr.sub_inplace(&LinearExpr::from_var(&x, 1.0));
+                expr.sub_inplace(&LinearExpr::from_var(&y, 1.0));
                 self.ilp.constraints.push(Constraint {
-                    name: format!("or_le_{}", v),
+                    name: format!("or_le_{}", z),
                     expr,
                     sense: Sense::Le,
                     rhs: 0.0,
                 });
-                Ok(v)
-            }
-            Expr::Implies(a, b) => {
-                // (1-a) OR b
-                let na = Expr::Not(a.clone());
-                let or = Expr::Or(Box::new(na), b.clone());
-                self.eval_bool_expr(&or, ctx)
-            }
-            Expr::Eq(a, b) => {
-                // boolean equality: a == b
-                let x = self.eval_bool_expr(a, ctx)?;
-                let y = self.eval_bool_expr(b, ctx)?;
-                if x == y {
-                    return Ok("__const1".into());
-                }
-                let v = self.new_aux("eq");
-                // v = 1 - (x xor y). linearize with 4 constraints:
-                // v <= 1 - x + y; v <= 1 + x - y; v >= 1 - x - y; v >= -1 + x + y
-                self.ilp.constraints.push(Constraint {
-                    name: format!("eq_c1_{}", v),
-                    expr: LinearExpr::from_var(&v, 1.0)
-                        .add(LinearExpr::from_var(&x, 1.0))
-                        .sub(LinearExpr::from_var(&y, 1.0)),
-                    sense: Sense::Le,
-                    rhs: 1.0,
-                });
-                self.ilp.constraints.push(Constraint {
-                    name: format!("eq_c2_{}", v),
-                    expr: LinearExpr::from_var(&v, 1.0)
-                        .sub(LinearExpr::from_var(&x, 1.0))
-                        .add(LinearExpr::from_var(&y, 1.0)),
-                    sense: Sense::Le,
-                    rhs: 1.0,
-                });
-                self.ilp.constraints.push(Constraint {
-                    name: format!("eq_c3_{}", v),
-                    expr: LinearExpr::from_var(&v, 1.0)
-                        .add(LinearExpr::from_var(&x, 1.0))
-                        .add(LinearExpr::from_var(&y, 1.0)),
-                    sense: Sense::Ge,
-                    rhs: 1.0,
-                });
-                self.ilp.constraints.push(Constraint {
-                    name: format!("eq_c4_{}", v),
-                    expr: LinearExpr::from_var(&v, 1.0)
-                        .sub(LinearExpr::from_var(&x, 1.0))
-                        .sub(LinearExpr::from_var(&y, 1.0)),
-                    sense: Sense::Ge,
-                    rhs: -1.0,
-                });
-                Ok(v)
+                Ok(z)
             }
             Expr::OrList(xs) => {
-                // fold OR over list
-                let mut it = xs.iter();
-                let Some(first) = it.next() else {
+                if xs.is_empty() {
                     return Ok("__const0".into());
-                };
-                let mut acc = self.eval_bool_expr(first, ctx)?;
-                for x in it {
-                    let rhs = self.eval_bool_expr(x, ctx)?;
-                    let tmp = self.new_aux("orlist");
-                    // tmp = acc OR rhs
-                    // tmp >= acc; tmp >= rhs; tmp <= acc+rhs
+                }
+                let mut terms = vec![];
+                for x in xs {
+                    terms.push(self.eval_bool(x, ctx)?);
+                }
+                if terms.iter().any(|t| t == "__const1") {
+                    return Ok("__const1".into());
+                }
+                terms.retain(|t| t != "__const0");
+                if terms.is_empty() {
+                    return Ok("__const0".into());
+                }
+                if terms.len() == 1 {
+                    return Ok(terms[0].clone());
+                }
+                let z = self.fresh_aux("orlist");
+                self.ilp.binaries.insert(z.clone());
+                // z >= each
+                for (i, t) in terms.iter().enumerate() {
                     self.ilp.constraints.push(Constraint {
-                        name: format!("orlist_ge1_{}", tmp),
-                        expr: LinearExpr::from_var(&tmp, 1.0).sub(LinearExpr::from_var(&acc, 1.0)),
-                        sense: Sense::Ge,
-                        rhs: 0.0,
-                    });
-                    self.ilp.constraints.push(Constraint {
-                        name: format!("orlist_ge2_{}", tmp),
-                        expr: LinearExpr::from_var(&tmp, 1.0).sub(LinearExpr::from_var(&rhs, 1.0)),
-                        sense: Sense::Ge,
-                        rhs: 0.0,
-                    });
-                    self.ilp.constraints.push(Constraint {
-                        name: format!("orlist_le_{}", tmp),
-                        expr: LinearExpr::from_var(&tmp, 1.0)
-                            .sub(LinearExpr::from_var(&acc, 1.0))
-                            .sub(LinearExpr::from_var(&rhs, 1.0)),
+                        name: format!("orlist_ge{}_{}", i, z),
+                        expr: LinearExpr::from_var(t, 1.0).sub(LinearExpr::from_var(&z, 1.0)),
                         sense: Sense::Le,
                         rhs: 0.0,
                     });
-                    acc = tmp;
                 }
-                Ok(acc)
-            }
-            Expr::Paren(x) => self.eval_bool_expr(x, ctx),
-            Expr::Call { name, .. } => {
-                // allow Observe in bool context
-                let le = self.eval_linear_expr(e, ctx)?;
-                if le.terms.len() == 1 && le.constant == 0.0 {
-                    return Ok(le.terms.keys().next().unwrap().clone());
+                // z <= sum(terms)
+                let mut expr = LinearExpr::from_var(&z, 1.0);
+                for t in &terms {
+                    expr.sub_inplace(&LinearExpr::from_var(t, 1.0));
                 }
-                Err(CodegenError::Unsupported(format!(
-                    "call {name} in bool expr"
-                )))
+                self.ilp.constraints.push(Constraint {
+                    name: format!("orlist_le_{}", z),
+                    expr,
+                    sense: Sense::Le,
+                    rhs: 0.0,
+                });
+                Ok(z)
             }
-            _ => Err(CodegenError::Unsupported(format!(
-                "unsupported bool expr: {e:?}"
-            ))),
+            Expr::Implies(a, b) => {
+                // a -> b == (!a) OR b
+                let na = Expr::Not(a.clone());
+                let or = Expr::Or(Box::new(na), b.clone());
+                self.eval_bool(&or, ctx)
+            }
+            Expr::Iff(a, b) => {
+                // (a->b) and (b->a)
+                let ab = Expr::Implies(a.clone(), b.clone());
+                let ba = Expr::Implies(b.clone(), a.clone());
+                let and = Expr::And(Box::new(ab), Box::new(ba));
+                self.eval_bool(&and, ctx)
+            }
+            Expr::Call { name, args } => self.eval_bool_call(name, args, ctx),
+            Expr::Paren(x) => self.eval_bool(x, ctx),
+            Expr::NamedArg { .. } => Err(CodegenError::UnsupportedBool(e.clone())),
+            // comparisons are not reified (only allowed at top-level Require/ForceEq)
+            Expr::Eq(..)
+            | Expr::Le(..)
+            | Expr::Ge(..)
+            | Expr::Lt(..)
+            | Expr::Gt(..)
+            | Expr::Add(..)
+            | Expr::Sub(..)
+            | Expr::Mul(..)
+            | Expr::Sum { .. }
+            | Expr::Sym(_)
+            | Expr::Neg(_) => Err(CodegenError::UnsupportedBool(e.clone())),
         }
     }
-}
 
-/// Statement-local context for evaluation.
-#[derive(Clone, Default)]
-struct Ctx {
-    binders: HashMap<String, String>,
-    lets: HashMap<String, Expr>,
-}
-impl Ctx {
-    fn suffix(&self) -> String {
-        // stable suffix for constraint naming: join binder assigns
-        let mut kv: Vec<_> = self.binders.iter().collect();
-        kv.sort_by_key(|(k, _)| *k);
-        kv.into_iter()
-            .map(|(k, v)| format!("{k}{v}"))
-            .collect::<Vec<_>>()
-            .join("_")
-    }
-}
-
-/// Infer binder variables and their domain names from a statement by looking at varrefs with known signatures.
-fn infer_binders(
-    st: &Stmt,
-    sigs: &HashMap<String, Vec<String>>,
-    let_names: &BTreeSet<String>,
-) -> Result<BTreeMap<String, String>, CodegenError> {
-    let mut map: BTreeMap<String, String> = BTreeMap::new();
-    let mut visit_vr = |vr: &VarRef| -> Result<(), CodegenError> {
-        let Some(domains) = sigs.get(&vr.name) else {
-            return Ok(());
-        };
-        for (i, idx) in vr.indices.iter().enumerate() {
-            if let Expr::Sym(v) = idx {
-                if let Some(dom) = domains.get(i) {
-                    if let_names.contains(v) {
-                        continue;
-                    }
-                    if let Some(prev) = map.get(v) {
-                        if prev != dom {
-                            return Err(CodegenError::ConflictingBinder {
-                                var: v.clone(),
-                                a: prev.clone(),
-                                b: dom.clone(),
-                            });
+    fn eval_bool_call(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        ctx: &Ctx,
+    ) -> Result<String, CodegenError> {
+        match name {
+            "OR" => {
+                // OR(X) where X is a sources varref
+                if args.len() == 1 {
+                    if let Expr::Var(vr) = &args[0] {
+                        if self.var_kind(&vr.name) == Some(VarKind::Sources) {
+                            let key = self.sources_key(vr, ctx)?;
+                            return self.ensure_sources_or(&key);
                         }
-                    } else {
-                        map.insert(v.clone(), dom.clone());
                     }
                 }
+                // otherwise treat as OR-list of args
+                let or = Expr::OrList(args.to_vec());
+                self.eval_bool(&or, ctx)
             }
-        }
-        Ok(())
-    };
-
-    fn walk_expr(
-        e: &Expr,
-        sigs: &HashMap<String, Vec<String>>,
-        visit_vr: &mut dyn FnMut(&VarRef) -> Result<(), CodegenError>,
-    ) -> Result<(), CodegenError> {
-        match e {
-            Expr::Var(vr) => visit_vr(vr)?,
-            Expr::Not(x) => walk_expr(x, sigs, visit_vr)?,
-            Expr::And(a, b)
-            | Expr::Or(a, b)
-            | Expr::Add(a, b)
-            | Expr::Sub(a, b)
-            | Expr::Mul(a, b)
-            | Expr::Eq(a, b)
-            | Expr::Le(a, b)
-            | Expr::Ge(a, b)
-            | Expr::Lt(a, b)
-            | Expr::Gt(a, b)
-            | Expr::Implies(a, b) => {
-                walk_expr(a, sigs, visit_vr)?;
-                walk_expr(b, sigs, visit_vr)?;
-            }
-            Expr::OrList(xs) => {
-                for x in xs {
-                    walk_expr(x, sigs, visit_vr)?;
-                }
-            }
-            Expr::Sum { binder: _, body } => walk_expr(body, sigs, visit_vr)?,
-            Expr::Call { args, .. } => {
-                for a in args {
-                    match a {
-                        Expr::NamedArg { value, .. } => walk_expr(value, sigs, visit_vr)?,
-                        _ => walk_expr(a, sigs, visit_vr)?,
+            "Observe" => {
+                // Observe(PIN, s=0) -> ConcreteVar
+                let pin = match args.get(0) {
+                    Some(Expr::Sym(p)) => p.clone(),
+                    Some(Expr::Var(vr)) => vr.name.clone(),
+                    Some(x) => match x {
+                        Expr::Paren(p) => match &**p {
+                            Expr::Sym(pn) => pn.clone(),
+                            _ => return Err(CodegenError::UnsupportedCall("Observe".into())),
+                        },
+                        _ => return Err(CodegenError::UnsupportedCall("Observe".into())),
+                    },
+                    None => return Err(CodegenError::UnsupportedCall("Observe".into())),
+                };
+                let mut sc: Option<String> = None;
+                for a in args.iter().skip(1) {
+                    if let Expr::NamedArg { name, value } = a {
+                        if name == "s" {
+                            sc = Some(self.eval_index(value, ctx)?);
+                        }
                     }
                 }
+                let Some(sc) = sc else {
+                    return Err(CodegenError::BadScenario("missing".into()));
+                };
+                let sci: i32 = sc
+                    .parse::<i32>()
+                    .map_err(|_| CodegenError::BadScenario(sc.clone()))?;
+                let cv = (self.env.observe)(&pin, sci);
+                let vname = cv.lp_name();
+                self.ilp.binaries.insert(vname.clone());
+                Ok(vname)
             }
-            Expr::Paren(x) => walk_expr(x, sigs, visit_vr)?,
-            Expr::NamedArg { value, .. } => walk_expr(value, sigs, visit_vr)?,
-            Expr::Sym(_) | Expr::Lit(_) => {}
-        }
-        Ok(())
-    }
-
-    match st {
-        Stmt::ForAll { binders, body } => {
-            // 1) explicit binders: validate duplicates + build "shadow" set
-            let mut shadow: BTreeSet<String> = let_names.iter().cloned().collect();
-
-            // (선택) ForAll에 있는 binder들끼리 충돌 검사
-            for (v, dom) in binders {
-                if let Some(prev) = map.get(v) {
-                    if prev != dom {
-                        return Err(CodegenError::ConflictingBinder {
-                            var: v.clone(),
-                            a: prev.clone(),
-                            b: dom.clone(),
-                        });
-                    }
+            "TorchOut" => {
+                // TorchOut(stand,c) or TorchOut(wall,c,d) uses scenario binder `s`
+                let s = ctx
+                    .bind
+                    .get("s")
+                    .cloned()
+                    .ok_or_else(|| CodegenError::MissingScenarioBinder("TorchOut".into()))?;
+                let kind = match args.get(0) {
+                    Some(Expr::Sym(k)) => k.clone(),
+                    _ => return Err(CodegenError::UnsupportedCall("TorchOut".into())),
+                };
+                if kind == "stand" {
+                    let c = self.eval_index(&args[1], ctx)?;
+                    let vr = VarRef {
+                        name: "TO_stand".into(),
+                        indices: vec![Expr::Sym(s), Expr::Sym(c)],
+                    };
+                    self.var_name(&vr, ctx)
+                } else if kind == "wall" {
+                    let c = self.eval_index(&args[1], ctx)?;
+                    let d = self.eval_index(&args[2], ctx)?;
+                    let vr = VarRef {
+                        name: "TO_wall".into(),
+                        indices: vec![Expr::Sym(s), Expr::Sym(c), Expr::Sym(d)],
+                    };
+                    self.var_name(&vr, ctx)
                 } else {
-                    // 여기서 map에 넣어둘지 말지 선택:
-                    // - 넣으면: "ForAll은 explicit binder를 가지고 있다"는 정보를 리턴함
-                    // - 안 넣으면: infer_binders 결과가 ForAll 바깥 확장에 영향 주지 않음
-                    //
-                    // 추천: ForAll은 codegen이 별도 처리하므로 'map에는 넣지 않는 것'이 안전함.
-                    // map.insert(v.clone(), dom.clone());
+                    Err(CodegenError::UnsupportedCall("TorchOut".into()))
                 }
-                shadow.insert(v.clone());
+            }
+            "RepOut" => {
+                let s = ctx
+                    .bind
+                    .get("s")
+                    .cloned()
+                    .ok_or_else(|| CodegenError::MissingScenarioBinder("RepOut".into()))?;
+                let c = self.eval_index(&args[0], ctx)?;
+                let d = self.eval_index(&args[1], ctx)?;
+                let vr = VarRef {
+                    name: "RO".into(),
+                    indices: vec![Expr::Sym(s), Expr::Sym(c), Expr::Sym(d)],
+                };
+                self.var_name(&vr, ctx)
+            }
+            "CandidateDustAdj" => {
+                // CandidateDustAdj(l,c,d) -> D[l, neigh(c,d)]
+                let l = self.eval_index(&args[0], ctx)?;
+                let c = self.eval_index(
+                    &Expr::Call {
+                        name: "neigh".into(),
+                        args: vec![args[1].clone(), args[2].clone()],
+                    },
+                    ctx,
+                )?;
+                let vr = VarRef {
+                    name: "D".into(),
+                    indices: vec![Expr::Sym(l), Expr::Sym(c)],
+                };
+                self.var_name(&vr, ctx)
+            }
+            "ExistsConnectionCandidate" => {
+                // OR of neighbor placements
+                let l = self.eval_index(&args[0], ctx)?;
+                let neigh = self.eval_index(
+                    &Expr::Call {
+                        name: "neigh".into(),
+                        args: vec![args[1].clone(), args[2].clone()],
+                    },
+                    ctx,
+                )?;
+                if neigh == "__NONE__" {
+                    return Ok("__const0".into());
+                }
+                let mut ors: Vec<Expr> = vec![];
+                // dust neighbor
+                ors.push(Expr::Var(VarRef {
+                    name: "D".into(),
+                    indices: vec![Expr::Sym(l.clone()), Expr::Sym(neigh.clone())],
+                }));
+                // block neighbor
+                ors.push(Expr::Var(VarRef {
+                    name: "S".into(),
+                    indices: vec![Expr::Sym(neigh.clone())],
+                }));
+                // standing torch neighbor
+                ors.push(Expr::Var(VarRef {
+                    name: "T_stand".into(),
+                    indices: vec![Expr::Sym(neigh.clone())],
+                }));
+                // wall torches / repeaters neighbor (any dir)
+                let dirs = self.domain_vals("Dir")?;
+                for d in dirs {
+                    ors.push(Expr::Var(VarRef {
+                        name: "T_wall".into(),
+                        indices: vec![Expr::Sym(neigh.clone()), Expr::Sym(d.clone())],
+                    }));
+                    ors.push(Expr::Var(VarRef {
+                        name: "R".into(),
+                        indices: vec![Expr::Sym(neigh.clone()), Expr::Sym(d)],
+                    }));
+                }
+                self.eval_bool(&Expr::OrList(ors), ctx)
+            }
+            "ClearUp" | "ClearDown" | "AllowCrossChoice" | "Touches" => Ok("__const1".into()),
+            "TorchPowersCell" => Ok("__const0".into()),
+            _ => Err(CodegenError::UnsupportedCall(name.to_string())),
+        }
+    }
+
+    fn sources_key(&mut self, vr: &VarRef, ctx: &Ctx) -> Result<SourceKey, CodegenError> {
+        // build a canonical string from indices
+        let mut parts = vec![vr.name.clone()];
+        for idx in &vr.indices {
+            let s = self.eval_index(idx, ctx)?;
+            if s == "__NONE__" {
+                parts.push("__NONE__".into());
+            } else {
+                parts.push(s);
+            }
+        }
+        Ok(SourceKey {
+            name: parts.join("__"),
+        })
+    }
+
+    fn ensure_sources_or(&mut self, key: &SourceKey) -> Result<String, CodegenError> {
+        if let Some(v) = self.sources_or_cache.get(key) {
+            return Ok(v.clone());
+        }
+        // collect terms minus excludes
+        let mut terms = self.sources.adds.get(key).cloned().unwrap_or_default();
+        let ex = self.sources.excludes.get(key).cloned().unwrap_or_default();
+        terms.retain(|t| !ex.iter().any(|e| e == t));
+
+        // lower terms to bool vars
+        let ctx = Ctx::default(); // should not be used for concrete exprs (already concretized); still ok.
+        let mut term_vars: Vec<String> = vec![];
+        for t in terms {
+            let v = self.eval_bool(&t, &ctx)?;
+            if v == "__const1" {
+                self.sources_or_cache.insert(key.clone(), "__const1".into());
+                return Ok("__const1".into());
+            }
+            if v != "__const0" {
+                term_vars.push(v);
+            }
+        }
+        term_vars.sort();
+        term_vars.dedup();
+
+        if term_vars.is_empty() {
+            self.sources_or_cache.insert(key.clone(), "__const0".into());
+            return Ok("__const0".into());
+        }
+        if term_vars.len() == 1 {
+            self.sources_or_cache
+                .insert(key.clone(), term_vars[0].clone());
+            return Ok(term_vars[0].clone());
+        }
+
+        let z = self.fresh_aux("srcor");
+        self.ilp.binaries.insert(z.clone());
+        // z >= each: -z + t <= 0
+        for (i, t) in term_vars.iter().enumerate() {
+            self.ilp.constraints.push(Constraint {
+                name: format!("srcor_ge{}_{}", i, z),
+                expr: LinearExpr::from_var(t, 1.0).sub(LinearExpr::from_var(&z, 1.0)),
+                sense: Sense::Le,
+                rhs: 0.0,
+            });
+        }
+        // z <= sum(t): z - sum(t) <= 0
+        let mut expr = LinearExpr::from_var(&z, 1.0);
+        for t in &term_vars {
+            expr.sub_inplace(&LinearExpr::from_var(t, 1.0));
+        }
+        self.ilp.constraints.push(Constraint {
+            name: format!("srcor_le_{}", z),
+            expr,
+            sense: Sense::Le,
+            rhs: 0.0,
+        });
+
+        self.sources_or_cache.insert(key.clone(), z.clone());
+        Ok(z)
+    }
+
+    fn collect_sources(&mut self, spec: &ModelSpec) -> Result<(), CodegenError> {
+        for r in &spec.rules {
+            self.collect_stmt_block(&r.body, &Ctx::default())?;
+        }
+        Ok(())
+    }
+
+    fn collect_stmt_block(&mut self, body: &[Stmt], ctx: &Ctx) -> Result<(), CodegenError> {
+        for st in body {
+            self.collect_stmt(st, ctx)?;
+        }
+        Ok(())
+    }
+
+    /// Find "implicit" binders that are referenced in a statement without an explicit `forall`.
+    ///
+    /// Example:
+    ///   def DP0[s, x1_z0] <-> (D0[x1_z0] and DP0[s, x0_z0]);
+    /// should expand over `s in Sc` even if the rule omitted:
+    ///   forall (s in Sc) { ... }
+    ///
+    /// We infer binders only from *index positions* of `VarRef` occurrences.
+    /// If an index is `Sym(name)` and `name` is not bound by the current `Ctx`, and it is
+    /// not a literal value of the expected domain, then we treat it as a missing binder.
+    fn implicit_binders_for_stmt(&self, st: &Stmt, ctx: &Ctx) -> Result<Vec<Binder>, CodegenError> {
+        let mut sym_to_domain: BTreeMap<String, String> = BTreeMap::new();
+
+        let mut add_unbound = |var_name: &str, indices: &[Expr]| -> Result<(), CodegenError> {
+            let sig = self
+                .env
+                .sigs
+                .get(var_name)
+                .ok_or_else(|| CodegenError::UnknownVar(var_name.to_string()))?
+                .clone();
+
+            if sig.len() != indices.len() {
+                return Err(CodegenError::WrongArity(
+                    var_name.to_string(),
+                    sig.len(),
+                    indices.len(),
+                ));
             }
 
-            // 2) body scan: free symbols에 대한 충돌 검사(및 선택적으로 추론 결과 수집)
-            // shadow(= explicit binder + let)를 넘겨서, 그 이름들은 binder로 추론되지 않게 함.
-            for s in body {
-                let inner = infer_binders(s, sigs, &shadow)?;
+            for (dn, idx_expr) in sig.iter().zip(indices.iter()) {
+                // Only infer binders from a raw symbol in index position.
+                let Expr::Sym(sym) = idx_expr else { continue };
 
-                // ✅ 옵션 A (보수적): 바디에서 새로 추론된 binder는 "그냥 충돌검사용"으로만 쓰고 버림
-                // let _ = inner;
+                // Already bound => not implicit.
+                if ctx.bind.contains_key(sym) || ctx.lets.contains_key(sym) {
+                    continue;
+                }
 
-                // ✅ 옵션 B (편의): 바디에서 명시되지 않은 자유 심볼을 추가 binder로 허용하고 map에 합침
-                for (v, dom) in inner {
-                    if let Some(prev) = map.get(&v) {
-                        if prev != &dom {
-                            return Err(CodegenError::ConflictingBinder {
-                                var: v.clone(),
-                                a: prev.clone(),
-                                b: dom.clone(),
-                            });
-                        }
-                    } else {
-                        map.insert(v, dom);
+                // If `sym` is a literal value in the expected domain, keep it as a literal.
+                let dom_vals = self.domain_vals(dn)?;
+                if dom_vals.iter().any(|v| v == sym) {
+                    continue;
+                }
+
+                // Otherwise treat it as an implicit binder var.
+                sym_to_domain
+                    .entry(sym.clone())
+                    .or_insert_with(|| dn.clone());
+            }
+            Ok(())
+        };
+
+        fn visit_expr<F>(e: &Expr, f: &mut F)
+        where
+            F: FnMut(&VarRef),
+        {
+            match e {
+                Expr::Var(vr) => f(vr),
+
+                Expr::Not(x) | Expr::Paren(x) | Expr::Neg(x) => {
+                    visit_expr(x, f);
+                }
+
+                Expr::And(a, b)
+                | Expr::Or(a, b)
+                | Expr::Add(a, b)
+                | Expr::Sub(a, b)
+                | Expr::Mul(a, b)
+                | Expr::Le(a, b)
+                | Expr::Ge(a, b)
+                | Expr::Eq(a, b)
+                | Expr::Implies(a, b)
+                | Expr::Iff(a, b)
+                | Expr::Lt(a, b)
+                | Expr::Gt(a, b) => {
+                    visit_expr(a, f);
+                    visit_expr(b, f);
+                }
+
+                Expr::Sum { body, .. } => {
+                    visit_expr(body, f);
+                }
+
+                Expr::Call { args, .. } => {
+                    for a in args {
+                        visit_expr(a, f);
                     }
                 }
-            }
 
-            // 3) ForAll 자체는 implicit-expansion 대상으로 삼지 않게 빈 맵 리턴하고 싶으면:
-            // return Ok(BTreeMap::new());
-
-            // 4) 옵션 B를 썼다면 "바디에서 새로 추론된 것만" 리턴:
-        }
-        Stmt::Require(e) => walk_expr(e, sigs, &mut visit_vr)?,
-        Stmt::Def { lhs, rhs, .. } => {
-            visit_vr(lhs)?;
-            walk_expr(rhs, sigs, &mut visit_vr)?;
-        }
-        Stmt::ForceEq { lhs, rhs } => {
-            walk_expr(lhs, sigs, &mut visit_vr)?;
-            walk_expr(rhs, sigs, &mut visit_vr)?;
-        }
-        Stmt::Add {
-            target,
-            value,
-            cond,
-            ..
-        } => {
-            visit_vr(target)?;
-            walk_expr(value, sigs, &mut visit_vr)?;
-            if let Some(c) = cond {
-                walk_expr(c, sigs, &mut visit_vr)?;
-            }
-        }
-        Stmt::Let { .. } => {}
-        Stmt::Feature { body, .. } => {
-            for s in body {
-                let _ = infer_binders(s, sigs, let_names)?;
-            }
-        }
-    }
-    Ok(map)
-}
-
-/// Parse binder tokens into (vars, domains) with minimal patterns:
-/// - `c in Cell`
-/// - `(c,d) in Cell * Dir`
-fn parse_binder(b: &Binder) -> Result<(Vec<String>, Vec<String>), CodegenError> {
-    // Convert token stream into a flat string-ish pattern.
-    let toks = &b.toks;
-
-    // Helper: extract identifiers from a token list.
-    fn toks_to_idents(ts: &[Tok]) -> Vec<String> {
-        let mut out = vec![];
-        for t in ts {
-            match t {
-                Tok::Ident(s) => out.push(s.clone()),
-                Tok::Group { delim: _, inner } => out.extend(toks_to_idents(inner)),
-                _ => {}
-            }
-        }
-        out
-    }
-
-    // Pattern 1: ident in Ident
-    if toks.len() == 3 {
-        if let (Tok::Ident(v), Tok::Ident(in_kw), Tok::Ident(dom)) = (&toks[0], &toks[1], &toks[2])
-        {
-            if in_kw == "in" {
-                return Ok((vec![v.clone()], vec![dom.clone()]));
-            }
-        }
-    }
-
-    // Pattern 2: group(parens) in Ident * Ident
-    if toks.len() == 5 {
-        if let (
-            Tok::Group {
-                delim: TokDelim::Paren,
-                inner,
-            },
-            Tok::Ident(in_kw),
-            Tok::Ident(dom1),
-            Tok::Punct('*'),
-            Tok::Ident(dom2),
-        ) = (&toks[0], &toks[1], &toks[2], &toks[3], &toks[4])
-        {
-            if in_kw == "in" {
-                let vars = toks_to_idents(inner);
-                if vars.len() != 2 {
-                    return Err(CodegenError::BadBinder(
-                        "tuple binder must have 2 vars".into(),
-                    ));
+                Expr::OrList(exprs) => {
+                    for e in exprs {
+                        visit_expr(e, f);
+                    }
                 }
-                return Ok((vars, vec![dom1.clone(), dom2.clone()]));
+
+                Expr::NamedArg { value, .. } => {
+                    visit_expr(value, f);
+                }
+
+                Expr::Sym(_) | Expr::Lit(_) => {}
+            }
+        }
+
+        match st {
+            Stmt::Require(e) => {
+                visit_expr(e, &mut |vr| {
+                    let _ = add_unbound(&vr.name, &vr.indices);
+                });
+            }
+            Stmt::Def { lhs, rhs } => {
+                add_unbound(&lhs.name, &lhs.indices)?;
+                visit_expr(rhs, &mut |vr| {
+                    let _ = add_unbound(&vr.name, &vr.indices);
+                });
+            }
+            Stmt::ForceEq { lhs, rhs } => {
+                visit_expr(lhs, &mut |vr| {
+                    let _ = add_unbound(&vr.name, &vr.indices);
+                });
+                visit_expr(rhs, &mut |vr| {
+                    let _ = add_unbound(&vr.name, &vr.indices);
+                });
+            }
+            Stmt::Add {
+                target,
+                value,
+                cond,
+                ..
+            } => {
+                add_unbound(&target.name, &target.indices)?;
+                visit_expr(value, &mut |vr| {
+                    let _ = add_unbound(&vr.name, &vr.indices);
+                });
+                if let Some(c) = cond {
+                    visit_expr(c, &mut |vr| {
+                        let _ = add_unbound(&vr.name, &vr.indices);
+                    });
+                }
+            }
+            Stmt::ForAll { .. } | Stmt::Feature { .. } | Stmt::Let { .. } => {}
+        }
+
+        // Turn each inferred `sym -> domain` into a single-var binder.
+        let mut binders: Vec<Binder> = vec![];
+        for (sym, dom) in sym_to_domain {
+            binders.push(Binder {
+                vars: vec![sym],
+                domains: vec![dom],
+            });
+        }
+        Ok(binders)
+    }
+
+    fn collect_stmt(&mut self, st: &Stmt, ctx: &Ctx) -> Result<(), CodegenError> {
+        // Implicit binder expansion for statements that reference domain variables (e.g. `s`)
+        // without an explicit `forall`.
+        //
+        // Example: `DP0[s, ...]` -> expand `s in Sc` into `s=0/1`
+        if !matches!(
+            st,
+            Stmt::ForAll { .. } | Stmt::Feature { .. } | Stmt::Let { .. }
+        ) {
+            let ib = self.implicit_binders_for_stmt(st, ctx)?;
+            if !ib.is_empty() {
+                return self.expand_binders(&ib, ctx, |g, cctx| g.collect_stmt(st, &cctx));
+            }
+        }
+        match st {
+            Stmt::ForAll { binders, body } => {
+                self.expand_binders(binders, ctx, |g, cctx| g.collect_stmt_block(body, &cctx))?;
+            }
+            Stmt::Feature { name, body } => {
+                if self.is_feature_on(name) {
+                    self.collect_stmt_block(body, ctx)?;
+                }
+            }
+            Stmt::Let { name, expr } => {
+                let mut nctx = ctx.clone();
+                let v = self.eval_index(expr, ctx)?;
+                nctx.lets.insert(name.clone(), v);
+                // let affects subsequent statements only within same block, but for simplicity
+                // we treat let as local in code expansion by requiring explicit nesting.
+                // In our spec, lets are used inside forall blocks in small scope; we emulate by not supporting statement-seq let here.
+                let _ = nctx;
+            }
+            Stmt::Add {
+                exclude,
+                target,
+                value,
+                cond,
+            } => {
+                if self.var_kind(&target.name) != Some(VarKind::Sources) {
+                    return Ok(());
+                }
+                let key = self.sources_key(target, ctx)?;
+                let mut val = concretize_expr(value, ctx)?;
+                if let Some(c) = cond {
+                    let cc = concretize_expr(c, ctx)?;
+                    val = Expr::And(Box::new(val), Box::new(cc));
+                }
+                if *exclude {
+                    self.sources.excludes.entry(key).or_default().push(val);
+                } else {
+                    self.sources.adds.entry(key).or_default().push(val);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn emit_model(&mut self, spec: &ModelSpec) -> Result<(), CodegenError> {
+        for r in &spec.rules {
+            self.emit_stmt_block(&r.name, &r.body, &Ctx::default())?;
+        }
+        if let Some(obj) = &spec.objective {
+            self.ilp.sense = obj.sense.clone();
+            let lin = self.eval_linear(&obj.expr, &Ctx::default())?;
+            self.ilp.objective = lin;
+        }
+        Ok(())
+    }
+
+    fn emit_stmt_block(
+        &mut self,
+        rname: &str,
+        body: &[Stmt],
+        ctx: &Ctx,
+    ) -> Result<(), CodegenError> {
+        for st in body {
+            self.emit_stmt(rname, st, ctx)?;
+        }
+        Ok(())
+    }
+
+    fn emit_stmt(&mut self, rname: &str, st: &Stmt, ctx: &Ctx) -> Result<(), CodegenError> {
+        // Implicit binder expansion for statements that reference domain variables (e.g. `s`)
+        // without an explicit `forall`.
+        //
+        // Example: `DP0[s, ...]` -> expand `s in Sc` into `s=0/1`
+        if !matches!(
+            st,
+            Stmt::ForAll { .. } | Stmt::Feature { .. } | Stmt::Let { .. } | Stmt::Add { .. }
+        ) {
+            let ib = self.implicit_binders_for_stmt(st, ctx)?;
+            if !ib.is_empty() {
+                return self.expand_binders(&ib, ctx, |g, cctx| g.emit_stmt(rname, st, &cctx));
+            }
+        }
+        match st {
+            Stmt::ForAll { binders, body } => {
+                self.expand_binders(binders, ctx, |g, cctx| {
+                    g.emit_stmt_block(rname, body, &cctx)
+                })?;
+            }
+            Stmt::Feature { name, body } => {
+                if self.is_feature_on(name) {
+                    self.emit_stmt_block(rname, body, ctx)?;
+                }
+            }
+            Stmt::Let { name, expr } => {
+                // sequence-scoped let: we support by mutating ctx clone and emitting following statements in the same block
+                // This simple emitter cannot reorder; therefore we require lets to be inside their own ForAll blocks where used immediately.
+                let _ = (name, expr);
+            }
+            Stmt::Require(e) => self.emit_require(rname, e, ctx)?,
+            Stmt::Def { lhs, rhs } => self.emit_def(rname, lhs, rhs, ctx)?,
+            Stmt::ForceEq { lhs, rhs } => self.emit_force_eq(rname, lhs, rhs, ctx)?,
+            Stmt::Add { .. } => (), // already handled via SourceDB
+        }
+
+        Ok(())
+    }
+
+    fn emit_require(&mut self, rname: &str, e: &Expr, ctx: &Ctx) -> Result<(), CodegenError> {
+        // If top-level is comparison, emit linear constraint
+        match e {
+            Expr::Le(a, b) => {
+                let mut lhs = self.eval_linear(a, ctx)?;
+                let rhs = self.eval_linear(b, ctx)?;
+                lhs.sub_inplace(&rhs);
+                self.ilp.constraints.push(Constraint {
+                    name: format!("{}_req_le_{}", rname, self.aux_id),
+                    expr: lhs,
+                    sense: Sense::Le,
+                    rhs: 0.0,
+                });
+                Ok(())
+            }
+            Expr::Ge(a, b) => {
+                let mut lhs = self.eval_linear(a, ctx)?;
+                let rhs = self.eval_linear(b, ctx)?;
+                lhs.sub_inplace(&rhs);
+                self.ilp.constraints.push(Constraint {
+                    name: format!("{}_req_ge_{}", rname, self.aux_id),
+                    expr: lhs,
+                    sense: Sense::Ge,
+                    rhs: 0.0,
+                });
+                Ok(())
+            }
+            Expr::Eq(a, b) => {
+                let mut lhs = self.eval_linear(a, ctx)?;
+                let rhs = self.eval_linear(b, ctx)?;
+                lhs.sub_inplace(&rhs);
+                self.ilp.constraints.push(Constraint {
+                    name: format!("{}_req_eq_{}", rname, self.aux_id),
+                    expr: lhs,
+                    sense: Sense::Eq,
+                    rhs: 0.0,
+                });
+                Ok(())
+            }
+            Expr::Implies(a, b) => {
+                // For boolean implies: a <= b
+                let av = self.eval_bool(a, ctx)?;
+                let bv = self.eval_bool(b, ctx)?;
+                let mut lhs = LinearExpr::from_var(&av, 1.0);
+                lhs.sub_inplace(&LinearExpr::from_var(&bv, 1.0));
+                self.ilp.constraints.push(Constraint {
+                    name: format!("{}_req_impl_{}", rname, self.aux_id),
+                    expr: lhs,
+                    sense: Sense::Le,
+                    rhs: 0.0,
+                });
+                Ok(())
+            }
+            _ => {
+                let v = self.eval_bool(e, ctx)?;
+                self.ilp.constraints.push(Constraint {
+                    name: format!("{}_req_bool_{}", rname, self.aux_id),
+                    expr: LinearExpr::from_var(&v, 1.0),
+                    sense: Sense::Eq,
+                    rhs: 1.0,
+                });
+                Ok(())
             }
         }
     }
 
-    Err(CodegenError::BadBinder(format!(
-        "unsupported binder tokens: {toks:?}"
-    )))
-}
-
-/// Cartesian product helper.
-fn cartesian(dom_vals: &[Vec<String>]) -> Vec<Vec<String>> {
-    if dom_vals.is_empty() {
-        return vec![vec![]];
+    fn emit_def(
+        &mut self,
+        rname: &str,
+        lhs: &VarRef,
+        rhs: &Expr,
+        ctx: &Ctx,
+    ) -> Result<(), CodegenError> {
+        let lv = self.var_name(lhs, ctx)?;
+        let rv = self.eval_bool(rhs, ctx)?;
+        let mut lhs_expr = LinearExpr::from_var(&lv, 1.0);
+        lhs_expr.sub_inplace(&LinearExpr::from_var(&rv, 1.0));
+        self.ilp.constraints.push(Constraint {
+            name: format!("{}_def_{}", rname, self.aux_id),
+            expr: lhs_expr,
+            sense: Sense::Eq,
+            rhs: 0.0,
+        });
+        Ok(())
     }
-    let mut acc: Vec<Vec<String>> = vec![vec![]];
-    for vals in dom_vals {
-        let mut next = vec![];
-        for prefix in &acc {
-            for v in vals {
-                let mut p = prefix.clone();
-                p.push(v.clone());
-                next.push(p);
+
+    fn emit_force_eq(
+        &mut self,
+        rname: &str,
+        lhs: &Expr,
+        rhs: &Expr,
+        ctx: &Ctx,
+    ) -> Result<(), CodegenError> {
+        // force allows linear expressions
+        let mut le = self.eval_linear_or_boolish(lhs, ctx)?;
+        let re = self.eval_linear_or_boolish(rhs, ctx)?;
+        le.sub_inplace(&re);
+        self.ilp.constraints.push(Constraint {
+            name: format!("{}_force_{}", rname, self.aux_id),
+            expr: le,
+            sense: Sense::Eq,
+            rhs: 0.0,
+        });
+        Ok(())
+    }
+
+    fn expand_binders<F>(&mut self, binders: &[Binder], ctx: &Ctx, f: F) -> Result<(), CodegenError>
+    where
+        F: FnMut(&mut Generator, Ctx) -> Result<(), CodegenError>,
+    {
+        fn cartesian(domains: &[Vec<String>]) -> Vec<Vec<String>> {
+            let mut acc: Vec<Vec<String>> = vec![vec![]];
+            for dom in domains {
+                let mut next = vec![];
+                for a in &acc {
+                    for v in dom {
+                        let mut b = a.clone();
+                        b.push(v.clone());
+                        next.push(b);
+                    }
+                }
+                acc = next;
             }
+            acc
         }
-        acc = next;
+
+        fn rec<F>(
+            g: &mut Generator,
+            binders: &[Binder],
+            i: usize,
+            ctx: &Ctx,
+            f: &mut F,
+        ) -> Result<(), CodegenError>
+        where
+            F: FnMut(&mut Generator, Ctx) -> Result<(), CodegenError>,
+        {
+            if i == binders.len() {
+                return f(g, ctx.clone());
+            }
+            let b = &binders[i];
+            let mut doms: Vec<Vec<String>> = vec![];
+            for dn in &b.domains {
+                doms.push(g.domain_vals(dn)?);
+            }
+            let tuples = cartesian(&doms);
+            for t in tuples {
+                if t.len() != b.vars.len() {
+                    // if binder vars mismatch, skip
+                    continue;
+                }
+                let mut nctx = ctx.clone();
+                for (var, val) in b.vars.iter().zip(t.iter()) {
+                    nctx.bind.insert(var.clone(), val.clone());
+                }
+                rec(g, binders, i + 1, &nctx, f)?;
+            }
+            Ok(())
+        }
+
+        let mut ff = f;
+        rec(self, binders, 0, ctx, &mut ff)
     }
-    acc
 }
 
-fn sanitize(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
+// helper: deterministic concretization for sources terms
+fn concretize_expr(e: &Expr, ctx: &Ctx) -> Result<Expr, CodegenError> {
+    fn rec(e: &Expr, ctx: &Ctx) -> Result<Expr, CodegenError> {
+        Ok(match e {
+            Expr::Sym(s) => {
+                if let Some(v) = ctx.lets.get(s) {
+                    Expr::Sym(v.clone())
+                } else if let Some(v) = ctx.bind.get(s) {
+                    Expr::Sym(v.clone())
+                } else {
+                    Expr::Sym(s.clone())
+                }
+            }
+            Expr::Lit(v) => Expr::Lit(*v),
+            Expr::Var(vr) => {
+                let mut idx = vec![];
+                for i in &vr.indices {
+                    idx.push(rec(i, ctx)?);
+                }
+                Expr::Var(VarRef {
+                    name: vr.name.clone(),
+                    indices: idx,
+                })
+            }
+            Expr::NamedArg { name, value } => Expr::NamedArg {
+                name: name.clone(),
+                value: Box::new(rec(value, ctx)?),
+            },
+            Expr::Not(x) => Expr::Not(Box::new(rec(x, ctx)?)),
+            Expr::Neg(x) => Expr::Neg(Box::new(rec(x, ctx)?)),
+            Expr::And(a, b) => Expr::And(Box::new(rec(a, ctx)?), Box::new(rec(b, ctx)?)),
+            Expr::Or(a, b) => Expr::Or(Box::new(rec(a, ctx)?), Box::new(rec(b, ctx)?)),
+            Expr::Implies(a, b) => Expr::Implies(Box::new(rec(a, ctx)?), Box::new(rec(b, ctx)?)),
+            Expr::Iff(a, b) => Expr::Iff(Box::new(rec(a, ctx)?), Box::new(rec(b, ctx)?)),
+            Expr::Add(a, b) => Expr::Add(Box::new(rec(a, ctx)?), Box::new(rec(b, ctx)?)),
+            Expr::Sub(a, b) => Expr::Sub(Box::new(rec(a, ctx)?), Box::new(rec(b, ctx)?)),
+            Expr::Mul(a, b) => Expr::Mul(Box::new(rec(a, ctx)?), Box::new(rec(b, ctx)?)),
+            Expr::Eq(a, b) => Expr::Eq(Box::new(rec(a, ctx)?), Box::new(rec(b, ctx)?)),
+            Expr::Le(a, b) => Expr::Le(Box::new(rec(a, ctx)?), Box::new(rec(b, ctx)?)),
+            Expr::Ge(a, b) => Expr::Ge(Box::new(rec(a, ctx)?), Box::new(rec(b, ctx)?)),
+            Expr::Lt(a, b) => Expr::Lt(Box::new(rec(a, ctx)?), Box::new(rec(b, ctx)?)),
+            Expr::Gt(a, b) => Expr::Gt(Box::new(rec(a, ctx)?), Box::new(rec(b, ctx)?)),
+            Expr::OrList(xs) => Expr::OrList(
+                xs.iter()
+                    .map(|x| rec(x, ctx))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            Expr::Call { name, args } => Expr::Call {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|a| rec(a, ctx))
+                    .collect::<Result<Vec<_>, _>>()?,
+            },
+            Expr::Sum { binders, body } => Expr::Sum {
+                binders: binders.clone(),
+                body: Box::new(rec(body, ctx)?),
+            },
+            Expr::Paren(x) => Expr::Paren(Box::new(rec(x, ctx)?)),
+        })
+    }
+    rec(e, ctx)
+}
+
+trait LinExt {
+    fn sub(self, other: LinearExpr) -> LinearExpr;
+}
+impl LinExt for LinearExpr {
+    fn sub(mut self, other: LinearExpr) -> LinearExpr {
+        self.sub_inplace(&other);
+        self
+    }
+}
+
+fn emit_lp(ilp: &Ilp) -> String {
+    let mut out = String::new();
+    match ilp.sense {
+        ObjSense::Minimize => out.push_str("Minimize\n obj: "),
+        ObjSense::Maximize => out.push_str("Maximize\n obj: "),
+    }
+    out.push_str(&fmt_lin(&ilp.objective));
+    out.push('\n');
+    out.push_str("Subject To\n");
+    for c in &ilp.constraints {
+        out.push_str(&format!(
+            " {}: {} {} {}\n",
+            c.name,
+            fmt_lin(&c.expr),
+            fmt_sense(c.sense),
+            fmt_num(c.rhs)
+        ));
+    }
+    out.push_str("Binary\n");
+    for b in &ilp.binaries {
+        out.push_str(&format!(" {}\n", b));
+    }
+    out.push_str("End\n");
+    out
+}
+
+fn fmt_sense(s: Sense) -> &'static str {
+    match s {
+        Sense::Le => "<=",
+        Sense::Ge => ">=",
+        Sense::Eq => "=",
+    }
+}
+
+fn fmt_num(v: f64) -> String {
+    if (v - v.round()).abs() < 1e-9 {
+        format!("{}", v.round() as i64)
+    } else {
+        format!("{:.6}", v)
+    }
+}
+
+fn fmt_lin(e: &LinearExpr) -> String {
+    let mut parts: Vec<String> = vec![];
+    for (n, c) in e.terms.iter() {
+        if (c - 1.0).abs() < 1e-12 {
+            parts.push(format!("+1 {}", n));
+        } else if (c + 1.0).abs() < 1e-12 {
+            parts.push(format!("-1 {}", n));
+        } else {
+            parts.push(format!("{:+.6} {}", c, n));
+        }
+    }
+    if parts.is_empty() {
+        parts.push(format!("+0"));
+    }
+    if e.constant.abs() > 1e-12 {
+        parts.push(format!("{:+.6}", e.constant));
+    }
+    parts.join(" ")
 }

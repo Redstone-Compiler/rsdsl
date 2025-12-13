@@ -1,12 +1,10 @@
 [package]
 name = "rsdsl"
-version = "0.3.0"
-edition.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2021"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-[dev-dependencies]
 rsdsl_macros = { path = "../rsdsl_macros" }
+regex = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"], optional = true }

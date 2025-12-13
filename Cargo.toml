@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["rsdsl", "rsdsl_macros"]
-
-[workspace.package]
-edition = "2021"
-license = "MIT OR Apache-2.0"
+members = [
+  "rsdsl",
+  "rsdsl_macros",
+]

@@ -1,6 +1,65 @@
-use serde::{Deserialize, Serialize};
+pub use rsdsl_macros::rsdsl;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+pub mod scip_codegen;
+pub use scip_codegen::codegen_scip_lp;
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+/// A concrete boolean variable in the generated ILP (0/1).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConcreteVar {
+    pub name: String,
+}
+impl ConcreteVar {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+    pub fn lp_name(&self) -> String {
+        self.name.clone()
+    }
+}
+
+/// Runtime instance: provides concrete domains (cells, enums), feature flags, parameters, and Observe() mapping.
+#[derive(Clone)]
+pub struct Instance {
+    pub cells: Vec<Cell>,
+    pub scenarios: Vec<i32>,
+    pub params: HashMap<String, f64>,
+    pub features: HashSet<String>,
+    pub observe: Arc<dyn Fn(&str, i32) -> ConcreteVar + Send + Sync>,
+}
+impl Instance {
+    pub fn new(
+        cells: Vec<Cell>,
+        scenarios: Vec<i32>,
+        params: HashMap<String, f64>,
+        features: HashSet<String>,
+        observe: Arc<dyn Fn(&str, i32) -> ConcreteVar + Send + Sync>,
+    ) -> Self {
+        Self {
+            cells,
+            scenarios,
+            params,
+            features,
+            observe,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Cell {
+    pub x: i32,
+    pub z: i32,
+}
+impl Cell {
+    pub fn id(&self) -> String {
+        format!("x{}_z{}", self.x, self.z)
+    }
+}
+
+/// Model specification AST (produced by the proc-macro).
+#[derive(Clone, Debug)]
 pub struct ModelSpec {
     pub name: String,
     pub decls: Vec<Decl>,
@@ -8,79 +67,39 @@ pub struct ModelSpec {
     pub objective: Option<Objective>,
 }
 
-impl ModelSpec {
-    pub fn debug_print(&self) {
-        println!("== Model: {} ==", self.name);
-        println!("Decls: {}", self.decls.len());
-        println!("Rules: {}", self.rules.len());
-        if let Some(obj) = &self.objective {
-            println!("Objective: {:?}", obj);
-        }
-    }
-    pub fn to_pretty_json(&self) -> String {
-        serde_json::to_string_pretty(self).unwrap()
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub enum Decl {
-    Index(IndexDecl),
-    Enum(EnumDecl),
-    Scenario(ScenarioDecl),
-    Pin(PinDecl),
-    Fn(FnDecl),
-    Var(VarDecl),
+    Index {
+        name: String,
+        domain: String,
+    },
+    Enum {
+        name: String,
+        variants: Vec<String>,
+    },
+    Scenario {
+        name: String,
+        values: Vec<i32>,
+    },
+    Pin {
+        name: String,
+        ty: String,
+    },
+    Fn {
+        name: String,
+        args: Vec<(String, String)>,
+        ret: String,
+    },
+    Var {
+        kind: VarKind,
+        name: String,
+        indices: Vec<String>,
+        ty: String,
+    },
+    // objective weights etc are passed via Instance.params
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndexDecl {
-    pub name: String,
-    /// We keep RHS as a structured token list for now (not a string).
-    pub rhs_toks: Vec<Tok>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EnumDecl {
-    pub name: String,
-    pub variants: Vec<EnumVariant>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EnumVariant {
-    pub name: String,
-    pub value: Option<String>, // e.g. "=0"
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScenarioDecl {
-    pub name: String,
-    pub values: Vec<String>, // e.g. ["0","1"]
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PinDecl {
-    pub name: String,
-    pub ty: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FnDecl {
-    pub name: String,
-    pub args: Vec<String>,
-    pub ret: String,
-    pub ret_optional: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VarDecl {
-    pub kind: VarKind,
-    pub name: String,
-    pub indices: Vec<String>,
-    pub ty: Option<String>,         // after ':'
-    pub domain_leq: Option<String>, // after '<=' (domain link)
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VarKind {
     Place,
     State,
@@ -88,80 +107,71 @@ pub enum VarKind {
     Sources,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Rule {
     pub name: String,
     pub body: Vec<Stmt>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub enum Stmt {
-    Require(Expr),
-    Def {
-        lhs: VarRef,
-        op: DefOp,
-        rhs: Expr,
-    },
-    Let {
-        name: String,
-        value: Expr,
-    },
-    Add {
-        target: VarRef,
-        value: Expr,
-        cond: Option<Expr>,
-        exclude: bool,
-    },
-    ForceEq {
-        lhs: Expr,
-        rhs: Expr,
-    },
-    /// Explicit binder block: forall(v in Domain, ...) { body }
     ForAll {
-        binders: Vec<(String, String)>,
+        binders: Vec<Binder>,
         body: Vec<Stmt>,
     },
     Feature {
         name: String,
         body: Vec<Stmt>,
     },
+    Let {
+        name: String,
+        expr: Expr,
+    },
+    Require(Expr),
+    Def {
+        lhs: VarRef,
+        rhs: Expr,
+    },
+    Add {
+        exclude: bool,
+        target: VarRef,
+        value: Expr,
+        cond: Option<Expr>,
+    },
+    ForceEq {
+        lhs: Expr,
+        rhs: Expr,
+    },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum DefOp {
-    Iff,
+#[derive(Clone, Debug, PartialEq)]
+pub struct Binder {
+    pub vars: Vec<String>,
+    pub domains: Vec<String>, // cartesian product in order
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct VarRef {
     pub name: String,
     pub indices: Vec<Expr>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Objective {
-    pub sense: ObjSense,
-    pub body: Expr,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ObjSense {
-    Minimize,
-    Maximize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
     Sym(String),
-    Lit(String),
-
+    Lit(f64),
     Var(VarRef),
-    Call { name: String, args: Vec<Expr> },
-    NamedArg { name: String, value: Box<Expr> }, // used inside Call args
+    NamedArg {
+        name: String,
+        value: Box<Expr>,
+    },
 
     Not(Box<Expr>),
+    Neg(Box<Expr>),
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
+    Implies(Box<Expr>, Box<Expr>),
+    Iff(Box<Expr>, Box<Expr>),
 
     Add(Box<Expr>, Box<Expr>),
     Sub(Box<Expr>, Box<Expr>),
@@ -173,34 +183,27 @@ pub enum Expr {
     Lt(Box<Expr>, Box<Expr>),
     Gt(Box<Expr>, Box<Expr>),
 
-    Implies(Box<Expr>, Box<Expr>),
-
-    OrList(Vec<Expr>), // OR{...}
-    Sum { binder: Binder, body: Box<Expr> },
+    OrList(Vec<Expr>),
+    Call {
+        name: String,
+        args: Vec<Expr>,
+    },
+    Sum {
+        binders: Vec<Binder>,
+        body: Box<Expr>,
+    },
 
     Paren(Box<Expr>),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Binder {
-    pub toks: Vec<Tok>, // binder tokens (e.g. `c in Cell` or `(c,d) in Cell * Dir`)
+#[derive(Clone, Debug)]
+pub struct Objective {
+    pub sense: ObjSense,
+    pub expr: Expr, // linear expression
 }
 
-/// Serializable token representation (so we avoid "strings" for unparsed RHS fragments).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Tok {
-    Ident(String),
-    Lit(String),
-    Punct(char),
-    Group { delim: TokDelim, inner: Vec<Tok> },
+#[derive(Clone, Debug)]
+pub enum ObjSense {
+    Minimize,
+    Maximize,
 }
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum TokDelim {
-    Paren,
-    Bracket,
-    Brace,
-    None,
-}
-
-pub mod scip_codegen;
