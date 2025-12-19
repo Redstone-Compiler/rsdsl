@@ -1,3 +1,6 @@
+// NOTE: In your workspace, enable the `macros` feature (and set the correct `rsdsl_macros` path)
+// if you want `rsdsl!{...}` to be available.
+// This is gated so `cargo test` can run even when the proc-macro crate isn't present.
 pub use rsdsl_macros::rsdsl;
 
 pub mod scip_codegen;
